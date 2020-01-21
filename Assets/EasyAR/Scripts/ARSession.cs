@@ -5,259 +5,381 @@
 //  and other countries for the augmented reality technology developed by VisionStar Information Technology (Shanghai) Co., Ltd.
 //
 //================================================================================================================================
+
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace easyar
 {
-    public class ARSessionUpdateEventArgs : EventArgs
-    {
-        public InputFrame IFrame = null;
-        public OutputFrame OFrame = null;
-        public Matrix4x4 ImageRotationMatrixGlobal = Matrix4x4.identity;
-        public CameraParameters CameraParam = null;
-        public float screenRotation;
-    }
-
     public class ARSession : MonoBehaviour
     {
-        public enum FrameSource
+        public ARCenterMode CenterMode;
+        public TargetController CenterTarget;
+        public WorldRootController WorldRootController;
+        public ARHorizontalFlipMode HorizontalFlipNormal;
+        // default horizontal flip for front camera
+        public ARHorizontalFlipMode HorizontalFlipFront = ARHorizontalFlipMode.World;
+        public ARAssembly.AssembleMode AssembleMode;
+        [HideInInspector, SerializeField]
+        public ARAssembly Assembly = new ARAssembly();
+
+        private WorldRootController previousWorldRootController;
+        private int frameIndex = -1;
+        private KeyValuePair<bool, bool> frameStatus = new KeyValuePair<bool, bool>();
+
+        public delegate void FrameChangeAction(OutputFrame outputFrame, Matrix4x4 displayCompensation);
+
+        public event FrameChangeAction FrameChange;
+        public event Action<OutputFrame> FrameUpdate;
+        public event Action<WorldRootController> WorldRootChanged;
+
+        public enum ARCenterMode
         {
-            easyar
+            FirstTarget,
+            Camera,
+            SpecificTarget,
+            WorldRoot,
+            ExternalControl,
         }
 
-        CameraDevice easyarCamera;
-
-        InputFrameThrottler iFrameThrottler;
-        OutputFrameJoin oFrameJoin;
-        OutputFrameBuffer oFrameBuffer;
-
-        InputFrameToOutputFrameAdapter i2OAdapter;
-        InputFrameFork inputFrameFork;
-        OutputFrameFork outputFrameFork;
-        InputFrameToFeedbackFrameAdapter i2fAdapter;
-        FeedbackFrameFork feedbackFork;
-
-        ARSessionUpdateEventArgs args;
-
-        int frameIndex = -1;
-
-        bool initialized = false;
-
-        public CameraDevicePreference EasyarCameraPrefer = CameraDevicePreference.PreferObjectSensing;
-
-        public CameraDeviceFocusMode CameraFocusMode = CameraDeviceFocusMode.Continousauto;
-
-        public Vector2 CameraSize = new Vector2(1280, 720);
-
-        public FrameSource FrameSourceType;
-
-        public bool UseSecondCamera = false;
-
-        public int ForkOutputNum = 0;
-
-        public int JoinNum = 0;
-
-        public ImageTrackerBehaviour ImgTracker;
-
-        public SurfaceTrackerBehaviour SfTracker;
-
-        public CloudRecognizeBehaviour CloudImageRecognizer;
-
-        public CameraImageRenderer CameraBackgroundRenderer;
-
-        private void Awake()
+        public enum ARHorizontalFlipMode
         {
-            easyar.CameraDevice.requestPermissions(EasyARBehaviour.Scheduler, (System.Action<PermissionStatus, string>)((status, msg) =>
-            {
-                if (status == PermissionStatus.Granted)
-                {
-                    Init();
-                }
-                Debug.Log("[EasyAR] RequestPermissions status " + status + " msg " + msg);
-            }));
+            None,
+            World,
+            Target,
         }
 
-        void Init()
+        public Optional<CameraParameters> FrameCameraParameters { get; private set; }
+
+        private void Start()
         {
-            initialized = true;
-
-            iFrameThrottler = InputFrameThrottler.create();
-            oFrameBuffer = OutputFrameBuffer.create();
-            i2fAdapter = InputFrameToFeedbackFrameAdapter.create();
-            inputFrameFork = InputFrameFork.create(ForkOutputNum);
-            i2OAdapter = InputFrameToOutputFrameAdapter.create();
-            oFrameJoin = OutputFrameJoin.create(JoinNum);
-
-            if (FrameSourceType == FrameSource.easyar)
+            if (!EasyARController.Initialized)
             {
-                if (CameraDevice.isAvailable())
-                {
-                    Debug.Log("[EasyAR] use ezar camera device");
-                    easyarCamera = CameraDeviceSelector.createCameraDevice(EasyarCameraPrefer);
-                    var openResult = false;
-                    if(UseSecondCamera)
-                    {
-                        openResult = easyarCamera.openWithIndex(1);
-                    }
-                    else
-                    {
-                        openResult = easyarCamera.openWithType(CameraDeviceType.Default);
-                    }
-                    easyarCamera.setFocusMode(CameraFocusMode);
-
-                    if (!openResult)
-                    {
-                        Debug.Log("[EasyAR] open camera failed");
-                        initialized = false;
-                        return;
-                    }
-                    easyarCamera.setSize(new Vec2I((int)CameraSize.x, (int)CameraSize.y));
-                    easyarCamera.inputFrameSource().connect(iFrameThrottler.input());
-                    easyarCamera.start();
-                }
-                else
-                {
-                    initialized = false;
-                    Debug.Log("[EasyAR] ezar camera device can not work");
-                    return;
-                }
+                return;
             }
-
-            iFrameThrottler.output().connect(inputFrameFork.input());
-            inputFrameFork.output(0).connect(i2OAdapter.input());
-            i2OAdapter.output().connect(oFrameJoin.input(0));
-            outputFrameFork = OutputFrameFork.create(1);
-
-            int index = 0;
-            if (ImgTracker != null)
-            {
-                index++;
-                outputFrameFork = OutputFrameFork.create(2);
-                inputFrameFork.output(index).connect(i2fAdapter.input());
-                i2fAdapter.output().connect(ImgTracker.Input());
-                ImgTracker.Output().connect(oFrameJoin.input(index));
-                outputFrameFork.output(1).connect(i2fAdapter.sideInput());
-            }
-
-            if (SfTracker != null)
-            {
-                index++;
-                inputFrameFork.output(index).connect(SfTracker.Input());
-                SfTracker.Output().connect(oFrameJoin.input(index));
-            }
-
-            if (CloudImageRecognizer != null)
-            {
-                index++;
-                inputFrameFork.output(index).connect(CloudImageRecognizer.Input());
-            }
-
-            oFrameJoin.output().connect(outputFrameFork.input());
-            outputFrameFork.output(0).connect(oFrameBuffer.input());
-            oFrameBuffer.signalOutput().connect(iFrameThrottler.signalInput());
-
-            args = new ARSessionUpdateEventArgs();
+            Assembly.Assemble(this);
+            if (!WorldRootController) { WorldRootController = FindObjectOfType<WorldRootController>(); }
         }
 
         private void Update()
         {
-            if (!initialized)
+            if (!Assembly.Ready)
             {
+                OnEmptyFrame();
+                return;
+            }
+            if (WorldRootController != previousWorldRootController)
+            {
+                if (WorldRootChanged != null)
+                {
+                    WorldRootChanged(WorldRootController);
+                }
+                previousWorldRootController = WorldRootController;
+            }
+            var oFrame = Assembly.OutputFrame;
+            if (oFrame.OnNone)
+            {
+                OnEmptyFrame();
                 return;
             }
 
-            var oFrame = oFrameBuffer.peek();
-            if (!oFrame.OnSome) { Debug.Log("[EasyAR] oframe is null"); return; }
-            var iFrame = oFrame.Value.inputFrame();
-            if (iFrame == null) { oFrame.Value.Dispose(); Debug.Log("[EasyAR] iFrame is null"); return; }
-
-            var index = iFrame.index();
-            if (frameIndex == index)
+            using (var outputFrame = oFrame.Value)
+            using (var iFrame = outputFrame.inputFrame())
             {
-                oFrame.Value.Dispose();
-                iFrame.Dispose();
-                return;
-            }
-            frameIndex = index;
-
-            var camParams = iFrame.cameraParameters();
-            if (camParams == null) { Debug.Log("[EasyAR] camParams is null"); return; }
-
-            var screenRotation = Utility.GetScreenRotation();
-            var imageRotationDegree = camParams.imageOrientation(screenRotation);
-            var imageRotation = (float)(imageRotationDegree) / 180.0f * Mathf.PI;
-            Matrix4x4 rotationMatrixGlobal = Matrix4x4.identity;
-            rotationMatrixGlobal.m00 = Mathf.Cos(-imageRotation);
-            rotationMatrixGlobal.m01 = -Mathf.Sin(-imageRotation);
-            rotationMatrixGlobal.m10 = Mathf.Sin(-imageRotation);
-            rotationMatrixGlobal.m11 = Mathf.Cos(-imageRotation);
-            args.ImageRotationMatrixGlobal = rotationMatrixGlobal;
-            args.IFrame = iFrame;
-            args.OFrame = oFrame.Value;
-            args.CameraParam = camParams;
-
-            if (ImgTracker != null)
-                ImgTracker.UpdateFrame(args);
-
-            if (SfTracker != null)
-                SfTracker.UpdateFrame(args);
-
-            if (CameraBackgroundRenderer != null)
-                CameraBackgroundRenderer.UpdateFrame(args);
-
-            oFrame.Value.Dispose();
-            iFrame.Dispose();
-            camParams.Dispose();
-        }
-
-        public void SwitchCamera()
-        {
-            if (easyarCamera == null)
-            {
-                Debug.Log("only support easyar camera");
-                return;
-            }
-            CameraDeviceType type = easyarCamera.type();
-            if (type == CameraDeviceType.Front)
-            {
-                OpenCamera(true);
-            }
-            else
-            {
-                OpenCamera(false);
+                if (FrameCameraParameters.OnSome)
+                {
+                    FrameCameraParameters.Value.Dispose();
+                }
+                FrameCameraParameters = iFrame.cameraParameters();
+                var displayCompensation = EasyARController.Instance.Display.GetCompensation(FrameCameraParameters.Value);
+                var index = iFrame.index();
+                if (frameIndex != index && FrameChange != null)
+                {
+                    FrameChange(outputFrame, displayCompensation);
+                }
+                frameIndex = index;
+                // update self first, some flags will pass down to other components
+                OnFrameUpdate(outputFrame, iFrame, displayCompensation);
+                if (FrameUpdate != null)
+                {
+                    FrameUpdate(outputFrame);
+                }
             }
         }
 
-        public void OpenCamera(bool isBack)
+        private void OnDestroy()
         {
-            if (easyarCamera == null)
+            Assembly.Dispose();
+            if (FrameCameraParameters.OnSome)
             {
-                return;
+                FrameCameraParameters.Value.Dispose();
             }
-            easyarCamera.close();
-            easyarCamera.Dispose();
-            easyarCamera = CameraDeviceSelector.createCameraDevice(CameraDevicePreference.PreferObjectSensing);
-            easyarCamera.setFocusMode(CameraFocusMode);
-            bool openResult = false;
-            if (isBack)
+        }
+
+        private void OnFrameUpdate(OutputFrame outputFrame, InputFrame inputFrame, Matrix4x4 displayCompensation)
+        {
+            // world root
+            if (Assembly.RequireWorldCenter && !WorldRootController)
             {
-                openResult = easyarCamera.openWithType(CameraDeviceType.Back);
-                Debug.Log("[EasyAR] open camera back result " + openResult);
-                if (openResult)
-                    GL.invertCulling = false;
+                Debug.Log("WorldRoot not found, create from " + typeof(ARSession));
+                var gameObject = new GameObject("WorldRoot");
+                WorldRootController = gameObject.AddComponent<WorldRootController>();
+                if (WorldRootChanged != null)
+                {
+                    WorldRootChanged(WorldRootController);
+                }
+                previousWorldRootController = WorldRootController;
+            }
+            if (!Assembly.RequireWorldCenter && CenterMode == ARCenterMode.WorldRoot)
+            {
+                Debug.LogWarning("ARCenterMode.WorldRoot not available for target only tracking");
+                CenterMode = ARCenterMode.FirstTarget;
+            }
+
+            // horizontal flip
+            var hflip = HorizontalFlipNormal;
+            using (var cameraParameters = inputFrame.cameraParameters())
+            {
+                if (cameraParameters.cameraDeviceType() == CameraDeviceType.Front)
+                {
+                    hflip = HorizontalFlipFront;
+                }
+            }
+            var worldHFlip = false;
+            var targetHFlip = false;
+            switch (hflip)
+            {
+                case ARHorizontalFlipMode.World:
+                    worldHFlip = true;
+                    targetHFlip = false;
+                    break;
+                case ARHorizontalFlipMode.Target:
+                    worldHFlip = false;
+                    targetHFlip = true;
+                    break;
+                default:
+                    break;
+            }
+            foreach (var renderCamera in Assembly.RenderCameras)
+            {
+                renderCamera.SetProjectHFlip(worldHFlip);
+                renderCamera.SetRenderImageHFilp(worldHFlip || targetHFlip);
+            }
+            foreach (var filter in Assembly.FrameFilters)
+            {
+                filter.SetHFlip(targetHFlip);
+            }
+
+            // dispatch results
+            var results = outputFrame.results();
+            var motionTrackingStatus = Optional<MotionTrackingStatus>.CreateNone();
+            if (inputFrame.hasSpatialInformation())
+            {
+                motionTrackingStatus = inputFrame.trackingStatus();
+            }
+            var resultControllers = DispatchResults(results, motionTrackingStatus);
+
+            // get camera pose if available
+            var cameraPose = Optional<Matrix44F>.Empty;
+            if (Assembly.RequireWorldCenter)
+            {
+                if (motionTrackingStatus.OnSome)
+                {
+                    if (motionTrackingStatus.Value != MotionTrackingStatus.NotTracking)
+                    {
+                        cameraPose = inputFrame.cameraTransform();
+                    }
+                }
+                else
+                {
+                    foreach (var result in resultControllers)
+                    {
+                        if (result.Key.OnNone)
+                        {
+                            cameraPose = result.Value;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // get center target pose if available
+            var centerTargetPose = Optional<Matrix44F>.Empty;
+
+            if (CenterMode == ARCenterMode.FirstTarget || CenterMode == ARCenterMode.SpecificTarget)
+            {
+                foreach (var result in resultControllers)
+                {
+                    if (!CenterTarget)
+                        break;
+                    if (result.Key.OnNone)
+                        continue;
+                    if (result.Key == CenterTarget)
+                    {
+                        centerTargetPose = result.Value;
+                        break;
+                    }
+                }
+
+                if (CenterMode == ARCenterMode.FirstTarget && centerTargetPose.OnNone)
+                {
+                    foreach (var result in resultControllers)
+                    {
+                        if (result.Key.OnNone)
+                            continue;
+                        CenterTarget = result.Key.Value;
+                        centerTargetPose = result.Value;
+                        break;
+                    }
+                }
             }
             else
             {
-                openResult = easyarCamera.openWithType(CameraDeviceType.Front);
-                Debug.Log("[EasyAR] open camera front result " + openResult);
-                if (openResult)
-                    GL.invertCulling = true;
+                CenterTarget = null;
             }
 
-            easyarCamera.setSize(new Vec2I((int)CameraSize.x, (int)CameraSize.y));
-            easyarCamera.start();
-            easyarCamera.inputFrameSource().connect(iFrameThrottler.input());
+            // set camera transform first
+            if (CenterMode == ARCenterMode.FirstTarget || CenterMode == ARCenterMode.SpecificTarget)
+            {
+                if (CenterTarget && centerTargetPose.OnSome)
+                {
+                    TransformUtil.SetTargetPoseOnCamera(Assembly.CameraRoot, CenterTarget, centerTargetPose.Value, displayCompensation, targetHFlip);
+                }
+            }
+            else if (CenterMode == ARCenterMode.WorldRoot)
+            {
+                if (WorldRootController && cameraPose.OnSome)
+                {
+                    TransformUtil.SetCameraPoseOnCamera(Assembly.CameraRoot, WorldRootController, cameraPose.Value, displayCompensation, targetHFlip);
+                }
+            }
+
+            // set target and world root transform
+            if (CenterMode == ARCenterMode.Camera)
+            {
+                foreach (var result in resultControllers)
+                {
+                    if (result.Key.OnSome)
+                    {
+                        TransformUtil.SetTargetPoseOnTarget(Assembly.CameraRoot, result.Key.Value, result.Value, displayCompensation, targetHFlip);
+                    }
+                }
+                if (WorldRootController && cameraPose.OnSome)
+                {
+                    TransformUtil.SetCameraPoseOnWorldRoot(Assembly.CameraRoot, WorldRootController, cameraPose.Value, displayCompensation, targetHFlip);
+                }
+            }
+            else if (CenterMode == ARCenterMode.WorldRoot)
+            {
+                foreach (var result in resultControllers)
+                {
+                    if (result.Key.OnSome)
+                    {
+                        TransformUtil.SetTargetPoseOnTarget(Assembly.CameraRoot, result.Key.Value, result.Value, displayCompensation, targetHFlip);
+                    }
+                }
+            }
+            else if (CenterMode == ARCenterMode.FirstTarget || CenterMode == ARCenterMode.SpecificTarget)
+            {
+                foreach (var result in resultControllers)
+                {
+                    if (result.Key.OnSome && result.Key.Value != CenterTarget)
+                    {
+                        TransformUtil.SetTargetPoseOnTarget(Assembly.CameraRoot, result.Key.Value, result.Value, displayCompensation, targetHFlip);
+                    }
+                }
+                if (WorldRootController && cameraPose.OnSome)
+                {
+                    TransformUtil.SetCameraPoseOnWorldRoot(Assembly.CameraRoot, WorldRootController, cameraPose.Value, displayCompensation, targetHFlip);
+                }
+            }
+            else if (CenterMode == ARCenterMode.ExternalControl)
+            {
+                foreach (var result in resultControllers)
+                {
+                    if (result.Key.OnSome)
+                    {
+                        TransformUtil.SetTargetPoseOnTarget(Assembly.CameraRoot, result.Key.Value, result.Value, displayCompensation, targetHFlip);
+                    }
+                }
+            }
+
+            // dispose results
+            foreach (var result in results)
+            {
+                if (result.OnSome)
+                {
+                    result.Value.Dispose();
+                }
+            }
+        }
+
+        private void OnEmptyFrame()
+        {
+            if (frameStatus.Key)
+            {
+                if (FrameChange != null)
+                {
+                    FrameChange(null, Matrix4x4.identity);
+                }
+                DispatchResults(null, frameStatus.Value ? MotionTrackingStatus.NotTracking : Optional<MotionTrackingStatus>.CreateNone());
+            }
+            if (FrameCameraParameters.OnSome)
+            {
+                FrameCameraParameters.Value.Dispose();
+                FrameCameraParameters = Optional<CameraParameters>.CreateNone();
+            }
+        }
+
+        private List<KeyValuePair<Optional<TargetController>, Matrix44F>> DispatchResults(Optional<List<Optional<FrameFilterResult>>> results, Optional<MotionTrackingStatus> motionTrackingStatus)
+        {
+            var resultControllers = new List<KeyValuePair<Optional<TargetController>, Matrix44F>>();
+            var joinIndex = 0;
+            foreach (var filter in Assembly.FrameFilters)
+            {
+                if (!filter)
+                {
+                    Assembly.Break();
+                }
+                if (filter is FrameFilter.IOutputFrameSource)
+                {
+                    var outputFrameSource = filter as FrameFilter.IOutputFrameSource;
+                    var list = outputFrameSource.OnResult(results.OnSome ? results.Value[joinIndex] : null);
+                    if (list != null)
+                    {
+                        resultControllers.AddRange(list);
+                    }
+                    joinIndex++;
+                }
+                if (motionTrackingStatus.OnSome && filter is FrameFilter.ISpatialInformationSink)
+                {
+                    (filter as FrameFilter.ISpatialInformationSink).OnTracking(motionTrackingStatus.Value);
+                }
+            }
+
+            if (Assembly.RequireWorldCenter)
+            {
+                if (motionTrackingStatus.OnSome)
+                {
+                    WorldRootController.OnTracking(motionTrackingStatus.Value);
+                }
+                else
+                {
+                    var trackingStatus = MotionTrackingStatus.NotTracking;
+                    foreach (var result in resultControllers)
+                    {
+                        if (result.Key.OnNone)
+                        {
+                            trackingStatus = MotionTrackingStatus.Tracking;
+                            break;
+                        }
+                    }
+                    WorldRootController.OnTracking(trackingStatus);
+                }
+            }
+            frameStatus = new KeyValuePair<bool, bool>(results.OnSome, motionTrackingStatus.OnSome);
+            return resultControllers;
         }
     }
 }
