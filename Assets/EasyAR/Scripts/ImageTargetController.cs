@@ -5,220 +5,347 @@
 //  and other countries for the augmented reality technology developed by VisionStar Information Technology (Shanghai) Co., Ltd.
 //
 //================================================================================================================================
+
+using System;
 using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
-using easyar;
-using System.Runtime.InteropServices;
-public class ImageTargetController : MonoBehaviour
+
+namespace easyar
 {
-
-    public enum TargetType
+    public class ImageTargetController : TargetController
     {
-        LocalImage,
-        LocalTargetData,
-        Cloud
-    }
+        /// <summary>
+        /// EasyAR Sense API. Accessible after TargetAvailable event.
+        /// </summary>
+        public ImageTarget Target { get; private set; }
 
-    [HideInInspector]
-    public bool Tracked = false;
-    public string TargetName = null;
-    public string TargetPath = null;
-    public float TargetSize = 1f;
-    public PathType Type = PathType.StreamingAssets;
-    public ImageTrackerBehaviour ImageTracker = null;
+        public DataSource SourceType = DataSource.ImageFile;
+        [HideInInspector, SerializeField]
+        public ImageFileSourceData ImageFileSource = new ImageFileSourceData();
+        [HideInInspector, SerializeField]
+        public TargetDataFileSourceData TargetDataFileSource = new TargetDataFileSourceData();
+        public ImageTarget TargetSource;
 
-    private Target target = null;
-    public TargetType targetType = TargetType.LocalImage;
-
-    private bool xFlip = false;
-
-    private Image targetImage;
-
-    public Target Target()
-    {
-        return target;
-    }
-    public float TargetWidth
-    {
-        get
-        {
-            return transform.localScale.x;
-        }
-    }
-    public float TargetHeight
-    {
-        get
-        {
-            return transform.localScale.y;
-        }
-    }
-
-    public void SetTargetFromCloud(Target target)
-    {
-        this.target = target;
-        targetType = TargetType.Cloud;
-        var imageTarget = (target as ImageTarget);
-        TargetSize = imageTarget.scale();
-    }
-
-    private void Start()
-    {
-        for (int i = 0; i < transform.childCount; i++)
-        {
-            transform.GetChild(i).gameObject.SetActive(false);
-        }
-        switch (targetType)
-        {
-            case TargetType.LocalImage:
-            case TargetType.LocalTargetData:
-                StartCoroutine(LoadImageTarget());
-                break;
-            case TargetType.Cloud:
-                if (target != null)
-                {
-                    TargetName = target.name();
-                }
-                break;
-        }
-    }
-
-    private IEnumerator LoadImageTarget()
-    {
-        var path = TargetPath;
-        var type = Type;
-        WWW www;
-        if (type == PathType.Absolute)
-        {
-            path = Utility.AddFileHeader(path);
-#if UNITY_ANDROID && !UNITY_EDITOR
-            path = "file://" +  path;
+#if UNITY_EDITOR
+        public GizmoStorage GizmoData = new GizmoStorage();
 #endif
-        }
-        else if (type == PathType.StreamingAssets)
-        {
-            path = Utility.AddFileHeader(Application.streamingAssetsPath + "/" + path);
-        }
-        Debug.Log("[EasyAR]:" + path);
-        www = new WWW(path);
-        while (!www.isDone)
-        {
-            yield return 0;
-        }
-        if (!string.IsNullOrEmpty(www.error))
-        {
-            Debug.LogError(www.error);
-            www.Dispose();
-            yield break;
-        }
-        var data = www.bytes;
-        easyar.Buffer buffer = easyar.Buffer.create(data.Length);
-        var ptr = buffer.data();
-        Marshal.Copy(data, 0, ptr, data.Length);
 
-        Optional<easyar.ImageTarget> op_target;
-        if (targetType == TargetType.LocalImage)
+        [HideInInspector, SerializeField]
+        private bool trackerHasSet;
+        [HideInInspector, SerializeField]
+        private ImageTrackerFrameFilter tracker;
+        private ImageTrackerFrameFilter loader;
+        private float scale = 0.1f;
+        private float scaleX = 0.1f;
+        private bool preHFlip;
+
+        public event Action TargetAvailable;
+        public event Action<Target, bool> TargetLoad;
+        public event Action<Target, bool> TargetUnload;
+
+        public enum DataSource
         {
-            var image = ImageHelper.decode(buffer);
-            if (!image.OnSome)
+            ImageFile,
+            TargetDataFile,
+            Target,
+        }
+
+        public ImageTrackerFrameFilter Tracker
+        {
+            get
             {
-                throw new System.Exception("decode image file data failed");
+                return tracker;
+            }
+            set
+            {
+                tracker = value;
+                UpdateTargetInTracker();
+            }
+        }
+
+        public Vector2 Size
+        {
+            get
+            {
+                if (Target == null)
+                {
+                    return new Vector2();
+                }
+                return new Vector2(Target.scale(), Target.scale() / Target.aspectRatio());
+            }
+            private set { }
+        }
+
+        protected override void Start()
+        {
+            base.Start();
+            if (!EasyARController.Initialized)
+            {
+                return;
             }
 
-            var p = new ImageTargetParameters();
-            p.setImage(image.Value);
-            p.setName(TargetName);
-            p.setScale(TargetSize);
-            p.setUid("");
-            p.setMeta("");
-            op_target = ImageTarget.createFromParameters(p);
-
-            if (!op_target.OnSome)
+            switch (SourceType)
             {
-                throw new System.Exception("create image target failed from image target parameters");
+                case DataSource.ImageFile:
+                    LoadImageFile(new ImageFileSourceData()
+                    {
+                        PathType = ImageFileSource.PathType,
+                        Path = ImageFileSource.Path,
+                        Name = ImageFileSource.Name,
+                        Scale = ImageFileSource.Scale
+                    });
+                    break;
+                case DataSource.TargetDataFile:
+                    LoadTargetDataFile(new TargetDataFileSourceData()
+                    {
+                        PathType = TargetDataFileSource.PathType,
+                        Path = TargetDataFileSource.Path
+                    });
+                    break;
+                case DataSource.Target:
+                    LoadTarget(TargetSource);
+                    break;
+                default:
+                    break;
             }
-
-            image.Value.Dispose();
-            buffer.Dispose();
-            p.Dispose();
         }
-        else
-        {
-            op_target = ImageTarget.createFromTargetData(buffer);
 
-            if (!op_target.OnSome)
+        protected virtual void Update()
+        {
+            CheckScale();
+        }
+
+        protected virtual void OnDestroy()
+        {
+            if (tracker)
             {
-                throw new System.Exception("create image target failed from image target target data");
+                tracker = null;
+                UpdateTargetInTracker();
             }
-
-            buffer.Dispose();
+            if (Target != null)
+            {
+                Target.Dispose();
+                Target = null;
+            }
         }
 
-        target = op_target.Value;
-        Destroy(www.texture);
-        www.Dispose();
-        if (ImageTracker == null)
+        protected override void OnTracking()
         {
-            yield break;
-        }
-        ImageTracker.LoadImageTarget(this, (_target, status) =>
-        {
-            targetImage = ((_target as ImageTarget).images())[0];
-            Debug.Log("[EasyAR] Targtet name: " + _target.name() + " target runtimeID: " + _target.runtimeID() + " load status: " + status);
-            Debug.Log("[EasyAR] Target size" + targetImage.width() + " " + targetImage.height());
-        });
-    }
-
-    private void Update()
-    {
-        if (target != null)
-        {
-            var target = this.target as ImageTarget;
-        }
-    }
-
-    public void SetXFlip()
-    {
-        xFlip = !xFlip;
-    }
-
-    public void OnTracking(Matrix4x4 pose)
-    {
-        Debug.Log("[EasyAR] OnTracking targtet name: " + target.name());
-        Utility.SetMatrixOnTransform(transform, pose);
-        if (xFlip)
-        {
-            var scale = transform.localScale;
-            scale.x = -scale.x;
-            transform.localScale = scale;
+            CheckScale();
         }
 
-        transform.localScale = transform.localScale * TargetSize;
-    }
-
-    public void OnLost()
-    {
-        Debug.Log("[EasyAR] OnLost targtet name: " + target.name());
-        gameObject.SetActive(false);
-        for (int i = 0; i < transform.childCount; i++)
+        private void LoadImageFile(ImageFileSourceData source)
         {
-            transform.GetChild(i).gameObject.SetActive(false);
+            EasyARController.Instance.StartCoroutine(FileUtil.LoadFile(source.Path, source.PathType, (Buffer buffer) =>
+            {
+                EasyARController.Instance.StartCoroutine(LoadImageBuffer(buffer.Clone(), source));
+            }));
         }
-    }
 
-    public void OnFound()
-    {
-        Debug.Log("[EasyAR] OnFound targtet name: " + target.name());
-        gameObject.SetActive(true);
-        for (int i = 0; i < transform.childCount; i++)
+        private void LoadTargetDataFile(TargetDataFileSourceData source)
         {
-            transform.GetChild(i).gameObject.SetActive(true);
+            EasyARController.Instance.StartCoroutine(FileUtil.LoadFile(source.Path, source.PathType, (Buffer buffer) =>
+            {
+                EasyARController.Instance.StartCoroutine(LoadTargetDataBuffer(buffer.Clone()));
+            }));
         }
-    }
 
-    private void OnDestroy()
-    {
-        if (ImageTracker != null)
-            ImageTracker.UnloadImageTarget(this, (target, status) => { Debug.Log("[EasyAR] Targtet name: " + target.name() + " Target runtimeID: " + target.runtimeID() + " load status: " + status); });
+        private void LoadTarget(ImageTarget source)
+        {
+            Target = source;
+            if (Target != null && TargetAvailable != null)
+            {
+                TargetAvailable();
+            }
+            UpdateScale();
+            UpdateTargetInTracker();
+        }
+
+        private IEnumerator LoadImageBuffer(Buffer buffer, ImageFileSourceData source)
+        {
+            using (buffer)
+            {
+                Optional<Image> imageOptional = null;
+                bool taskFinished = false;
+                EasyARController.Instance.Worker.Run(() =>
+                {
+                    imageOptional = ImageHelper.decode(buffer);
+                    taskFinished = true;
+                });
+
+                while (!taskFinished)
+                {
+                    yield return 0;
+                }
+                if (imageOptional.OnNone)
+                {
+                    throw new Exception("invalid buffer");
+                }
+
+                using (var image = imageOptional.Value)
+                using (var param = new ImageTargetParameters())
+                {
+                    param.setImage(image);
+                    param.setName(source.Name);
+                    param.setScale(source.Scale);
+                    param.setUid(Guid.NewGuid().ToString());
+                    param.setMeta(string.Empty);
+                    var targetOptional = ImageTarget.createFromParameters(param);
+                    if (targetOptional.OnSome)
+                    {
+                        Target = targetOptional.Value;
+                        if (Target != null && TargetAvailable != null)
+                        {
+                            TargetAvailable();
+                        }
+                    }
+                    else
+                    {
+                        throw new Exception("invalid parameter");
+                    }
+                }
+            }
+            UpdateTargetInTracker();
+        }
+
+        private IEnumerator LoadTargetDataBuffer(Buffer buffer)
+        {
+            using (buffer)
+            {
+                Optional<ImageTarget> targetOptional = null;
+                bool taskFinished = false;
+                EasyARController.Instance.Worker.Run(() =>
+                {
+                    targetOptional = ImageTarget.createFromTargetData(buffer);
+                    taskFinished = true;
+                });
+
+                while (!taskFinished)
+                {
+                    yield return 0;
+                }
+                if (targetOptional.OnSome)
+                {
+                    Target = targetOptional.Value;
+                    if (Target != null && TargetAvailable != null)
+                    {
+                        TargetAvailable();
+                    }
+                }
+                else
+                {
+                    throw new Exception("invalid buffer");
+                }
+            }
+            UpdateTargetInTracker();
+        }
+
+        private void UpdateTargetInTracker()
+        {
+            if (Target == null)
+            {
+                return;
+            }
+            if (loader && loader != tracker)
+            {
+                loader.UnloadImageTarget(this, (target, status) =>
+                {
+                    if (TargetUnload != null)
+                    {
+                        TargetUnload(target, status);
+                    }
+                });
+                loader = null;
+            }
+            if (tracker && tracker != loader)
+            {
+                var trackerLoad = tracker;
+                tracker.LoadImageTarget(this, (target, status) =>
+                {
+                    if (trackerLoad == tracker && !status)
+                    {
+                        loader = null;
+                    }
+                    UpdateScale();
+                    if (TargetLoad != null)
+                    {
+                        TargetLoad(target, status);
+                    }
+                });
+                loader = tracker;
+            }
+        }
+
+        private void UpdateScale()
+        {
+            if (Target == null)
+                return;
+            scale = Target.scale();
+            var vec3Unit = Vector3.one;
+            if (HorizontalFlip)
+            {
+                vec3Unit.x = -vec3Unit.x;
+            }
+            transform.localScale = vec3Unit * scale;
+            scaleX = transform.localScale.x;
+            preHFlip = HorizontalFlip;
+        }
+
+        private void CheckScale()
+        {
+            if (Target == null)
+                return;
+            if (scaleX != transform.localScale.x)
+            {
+                Target.setScale(Math.Abs(transform.localScale.x));
+                UpdateScale();
+            }
+            else if (scale != transform.localScale.y)
+            {
+                Target.setScale(Math.Abs(transform.localScale.y));
+                UpdateScale();
+            }
+            else if (scale != transform.localScale.z)
+            {
+                Target.setScale(Math.Abs(transform.localScale.z));
+                UpdateScale();
+            }
+            else if (scale != Target.scale())
+            {
+                UpdateScale();
+            }
+            else if (preHFlip != HorizontalFlip)
+            {
+                UpdateScale();
+            }
+        }
+
+        [Serializable]
+        public class ImageFileSourceData
+        {
+            public PathType PathType = PathType.StreamingAssets;
+            public string Path = string.Empty;
+            public string Name = string.Empty;
+            public float Scale = 0.1f;
+        }
+
+        [Serializable]
+        public class TargetDataFileSourceData
+        {
+            public PathType PathType = PathType.StreamingAssets;
+            public string Path = string.Empty;
+        }
+
+#if UNITY_EDITOR
+        public class GizmoStorage
+        {
+            public string Signature;
+            public Texture2D Texture;
+            public Material Material;
+            public float Scale = 0.1f;
+            public float ScaleX = 0.1f;
+            public bool HorizontalFlip;
+        }
+#endif
     }
 }
