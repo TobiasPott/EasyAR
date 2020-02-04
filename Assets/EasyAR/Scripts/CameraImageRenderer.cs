@@ -5,158 +5,274 @@
 //  and other countries for the augmented reality technology developed by VisionStar Information Technology (Shanghai) Co., Ltd.
 //
 //================================================================================================================================
+
+using System;
 using UnityEngine;
 using UnityEngine.Rendering;
+
 namespace easyar
 {
-    [RequireComponent(typeof(Camera))]
+    [RequireComponent(typeof(RenderCameraController))]
     public class CameraImageRenderer : MonoBehaviour
     {
-        public enum RenderType
-        {
-            Normal,
-            Eyewear
-        }
-
-        public enum GlassesDisplay
-        {
-            Normal,
-            Left,
-            Right
-        }
-
+        private RenderCameraController controller;
         private CommandBuffer commandBuffer;
-        private ARMaterial arMat;
-        private Material mat;
-        private Camera targetCamera;
-        private RenderTexture targetTexture;
+        private CameraImageMaterial arMaterial;
+        private Material material;
+        private CameraParameters cameraParameters;
+        private bool renderImageHFlip;
+        private UserRequest request;
 
-        public RenderType Type = RenderType.Normal;
-        public GlassesDisplay Display = GlassesDisplay.Normal;
+        public event Action<Material, Vector2> OnFrameRenderUpdate;
+        private event Action<Camera, RenderTexture> TargetTextureChange;
 
-        public void SetRenderType(RenderType value)
+        protected virtual void Awake()
         {
-            if (value == RenderType.Eyewear)
-            {
-                targetCamera.RemoveAllCommandBuffers();
-            }
-            else
-            {
-                UpdateCommandBuffer();
-            }
-            Type = value;
+            controller = GetComponent<RenderCameraController>();
+            arMaterial = new CameraImageMaterial();
         }
 
-        public RenderTexture TargetTexture
+        protected virtual void OnEnable()
         {
-            get
+            UpdateCommandBuffer(controller ? controller.TargetCamera : null, material);
+        }
+
+        protected virtual void OnDisable()
+        {
+            RemoveCommandBuffer(controller ? controller.TargetCamera : null);
+        }
+
+        protected virtual void OnDestroy()
+        {
+            arMaterial.Dispose();
+            if (request != null) { request.Dispose(); }
+            if (cameraParameters != null) { cameraParameters.Dispose(); }
+        }
+
+        public void RequestTargetTexture(Action<Camera, RenderTexture> targetTextureEventHandler)
+        {
+            if (request == null)
             {
-                var screen_w = Screen.width;
-                var screen_h = Screen.height;
-                var w = screen_w * targetCamera.rect.width;
-                var h = screen_h * targetCamera.rect.height;
-                if (targetTexture == null)
+                request = new UserRequest();
+            }
+            TargetTextureChange += targetTextureEventHandler;
+            RenderTexture texture;
+            request.UpdateTexture(controller ? controller.TargetCamera : null, material, out texture);
+            if (TargetTextureChange != null && texture)
+            {
+                TargetTextureChange(controller.TargetCamera, texture);
+            }
+        }
+
+        public void DropTargetTexture(Action<Camera, RenderTexture> targetTextureEventHandler)
+        {
+            if (controller)
+            {
+                targetTextureEventHandler(controller.TargetCamera, null);
+            }
+            TargetTextureChange -= targetTextureEventHandler;
+            if (TargetTextureChange == null && request != null)
+            {
+                request.RemoveCommandBuffer(controller ? controller.TargetCamera : null);
+                request.Dispose();
+                request = null;
+            }
+        }
+
+        public void OnAssemble(ARSession session)
+        {
+            session.FrameChange += OnFrameChange;
+            session.FrameUpdate += OnFrameUpdate;
+        }
+
+        public void SetHFilp(bool hFlip)
+        {
+            renderImageHFlip = hFlip;
+        }
+
+        private void OnFrameChange(OutputFrame outputFrame, Matrix4x4 displayCompensation)
+        {
+            if (outputFrame == null)
+            {
+                material = null;
+                UpdateCommandBuffer(controller ? controller.TargetCamera : null, material);
+                if (request != null)
                 {
-                    targetTexture = new RenderTexture((int)w, (int)h, 0);
-                }
-                else
-                {
-                    if ((int)w != targetTexture.width || (int)h != targetTexture.height)
+                    request.UpdateCommandBuffer(controller ? controller.TargetCamera : null, material);
+                    RenderTexture texture;
+                    if (TargetTextureChange != null && request.UpdateTexture(controller.TargetCamera, material, out texture))
                     {
-                        Destroy(targetTexture);
-                        targetTexture = new RenderTexture((int)w, (int)h, 0);
-                        UpdateCommandBuffer();
+                        TargetTextureChange(controller.TargetCamera, texture);
                     }
                 }
-                return targetTexture;
+                return;
             }
-        }
-
-        private void UpdateCommandBuffer()
-        {
-            if (commandBuffer != null)
+            if (!enabled && request == null && OnFrameRenderUpdate == null)
             {
-                targetCamera.RemoveAllCommandBuffers();
-                commandBuffer.Dispose();
-                commandBuffer = new CommandBuffer();
-                commandBuffer.Blit(null, BuiltinRenderTextureType.CameraTarget, mat);
-                if (TargetTexture != null)
+                return;
+            }
+            using (var frame = outputFrame.inputFrame())
+            {
+                using (var image = frame.image())
                 {
-                    commandBuffer.Blit(BuiltinRenderTextureType.CameraTarget, TargetTexture);
+                    var materialUpdated = arMaterial.UpdateByImage(image);
+                    if (material != materialUpdated)
+                    {
+                        material = materialUpdated;
+                        UpdateCommandBuffer(controller ? controller.TargetCamera : null, material);
+                        if (request != null) { request.UpdateCommandBuffer(controller ? controller.TargetCamera : null, material); }
+                    }
                 }
-                targetCamera.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
+                if (cameraParameters != null)
+                {
+                    cameraParameters.Dispose();
+                }
+                cameraParameters = frame.cameraParameters();
             }
         }
 
-        private void Awake()
+        private void OnFrameUpdate(OutputFrame outputFrame)
         {
-            targetCamera = GetComponent<Camera>();
-            arMat = new ARMaterial();
+            if (!controller || (!enabled && request == null && OnFrameRenderUpdate == null))
+            {
+                return;
+            }
+
+            if (request != null)
+            {
+                RenderTexture texture;
+                if (TargetTextureChange != null && request.UpdateTexture(controller.TargetCamera, material, out texture))
+                {
+                    TargetTextureChange(controller.TargetCamera, texture);
+                }
+            }
+
+            if (!material)
+            {
+                return;
+            }
+
+            bool cameraFront = cameraParameters.cameraDeviceType() == CameraDeviceType.Front ? true : false;
+            var imageProjection = cameraParameters.imageProjection(controller.TargetCamera.aspect, EasyARController.Instance.Display.Rotation, false, cameraFront? !renderImageHFlip : renderImageHFlip).ToUnityMatrix();
+            if (renderImageHFlip)
+            {
+                var translateMatrix = Matrix4x4.identity;
+                translateMatrix.m00 = -1;
+                imageProjection = translateMatrix * imageProjection;
+            }
+            material.SetMatrix("_TextureRotation", imageProjection);
+            if (OnFrameRenderUpdate != null)
+            {
+                OnFrameRenderUpdate(material, new Vector2(Screen.width * controller.TargetCamera.rect.width, Screen.height * controller.TargetCamera.rect.height));
+            }
         }
 
-
-        private void UpdateRender(easyar.Image image)
+        private void UpdateCommandBuffer(Camera cam, Material material)
         {
-            if (image == null)
+            RemoveCommandBuffer(cam);
+            if (!cam || !material)
             {
                 return;
             }
-            var updateMat = arMat.UpdateByImage(image);
-            if (mat == updateMat)
+            if (enabled)
             {
-                return;
+                commandBuffer = new CommandBuffer();
+                commandBuffer.Blit(null, BuiltinRenderTextureType.CameraTarget, material);
+                cam.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
             }
-            mat = updateMat;
+        }
+
+        private void RemoveCommandBuffer(Camera cam)
+        {
             if (commandBuffer != null)
             {
-                targetCamera.RemoveCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
+                if (cam)
+                {
+                    cam.RemoveCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
+                }
                 commandBuffer.Dispose();
                 commandBuffer = null;
             }
-            commandBuffer = new CommandBuffer();
-            commandBuffer.Blit(null, BuiltinRenderTextureType.CameraTarget, mat);
-            if (TargetTexture != null)
-            {
-                commandBuffer.Blit(BuiltinRenderTextureType.CameraTarget, TargetTexture);
-            }
-            if (Type == RenderType.Normal)
-                targetCamera.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
         }
 
-        public void UpdateFrame(ARSessionUpdateEventArgs e)
+        private class UserRequest : IDisposable
         {
-            var frame = e.IFrame;
-            var image = frame.image();
-            if (image != null)
+            private RenderTexture texture;
+            private CommandBuffer commandBuffer;
+
+            ~UserRequest()
             {
-                var img = image;
-                UpdateRender(img);
-
-                var screenRotation = Utility.GetScreenRotation();
-                var viewport_aspect_ratio = targetCamera.aspect;
-                var projection = Utility.Matrix44FToMatrix4x4(e.CameraParam.projection(targetCamera.nearClipPlane, targetCamera.farClipPlane, viewport_aspect_ratio, screenRotation, true, false));
-
-                var imageProjection = Utility.Matrix44FToMatrix4x4(e.CameraParam.imageProjection(viewport_aspect_ratio, screenRotation, true, false));
-                targetCamera.projectionMatrix = projection * e.ImageRotationMatrixGlobal.inverse;
-
-                mat.SetMatrix("_TextureRotation", imageProjection);
-                img.Dispose();
+                if (commandBuffer != null) { commandBuffer.Dispose(); }
+                if (texture) { Destroy(texture); }
             }
-            else
+
+            public void Dispose()
             {
-                Debug.Log("[EasyAR] image is null");
+                if (commandBuffer != null) { commandBuffer.Dispose(); }
+                if (texture) { Destroy(texture); }
+                GC.SuppressFinalize(this);
             }
-        }
 
-        private void OnDestroy()
-        {
-            if (commandBuffer != null)
+            public bool UpdateTexture(Camera cam, Material material, out RenderTexture tex)
             {
-                targetCamera.RemoveCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
-                commandBuffer.Dispose();
+                tex = texture;
+                if (!cam || !material)
+                {
+                    if (texture)
+                    {
+                        Destroy(texture);
+                        tex = texture = null;
+                        return true;
+                    }
+                    return false;
+                }
+                int w = (int)(Screen.width * cam.rect.width);
+                int h = (int)(Screen.height * cam.rect.height);
+                if (texture && (texture.width != w || texture.height != h))
+                {
+                    Destroy(texture);
+                }
+
+                if (texture)
+                {
+                    return false;
+                }
+                else
+                {
+                    texture = new RenderTexture(w, h, 0);
+                    UpdateCommandBuffer(cam, material);
+                    tex = texture;
+                    return true;
+                }
             }
-            arMat.Dispose();
-            Destroy(targetTexture);
+
+            public void UpdateCommandBuffer(Camera cam, Material material)
+            {
+                RemoveCommandBuffer(cam);
+                if (!cam || !material)
+                {
+                    return;
+                }
+                if (texture)
+                {
+                    commandBuffer = new CommandBuffer();
+                    commandBuffer.Blit(null, texture, material);
+                    cam.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
+                }
+            }
+
+            public void RemoveCommandBuffer(Camera cam)
+            {
+                if (commandBuffer != null)
+                {
+                    if (cam)
+                    {
+                        cam.RemoveCommandBuffer(CameraEvent.BeforeForwardOpaque, commandBuffer);
+                    }
+                    commandBuffer.Dispose();
+                    commandBuffer = null;
+                }
+            }
         }
     }
 }
